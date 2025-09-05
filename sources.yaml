@@ -1,0 +1,44 @@
+ - name: "Мінветеранів"
+   base: "https://mva.gov.ua"
+   start_urls:
+     - "https://mva.gov.ua/category/86-novini"
+     - "https://mva.gov.ua/novini"
+   allow: ["^https?://mva\\.gov\\.ua/(prescenter|novini|news|category)/[\\w\\-/]+"]
+   deny: ["/tag/", "/page/", "\\.(pdf|jpg|png|zip)$"]
+   keywords: ["ветеран", "пільг", "послуг", "реабілітац", "житл", "uvf", "pfu"]
+   title_selector: "h1"
+   date_selector: 'meta[property="article:published_time"], time[datetime]'
+
+ - name: "е-Ветеран"
+   base: "https://eveteran.gov.ua"
+   start_urls: ["https://eveteran.gov.ua/"]
+   allow: ["^https?://eveteran\\.gov\\.ua/(services|materials|news)/[\\w\\-/]+"]
+   deny: ["/search"]
+   keywords: ["пільг", "статус", "послуг", "заява", "vet"]
+   title_selector: "h1"
+
+ - name: "Мінсоцполітики"
+   base: "https://www.msp.gov.ua"
+   start_urls: ["https://www.msp.gov.ua/press-center/news"]
+   allow: ["^https?://www\\.msp\\.gov\\.ua/press-center/news/[\\w\\-/]+"]
+   deny: ["/tag/", "/category/", "\\?.*"]
+   keywords: ["ветеран", "жкп", "виплат", "пільг"]
+   title_selector: "h1"
+
+ - name: "ПФУ"
+   base: "https://www.pfu.gov.ua"
+   start_urls:
+     - "https://www.pfu.gov.ua/news/"
+     - "https://www.pfu.gov.ua/"
+   allow: ["^https?://www\\.pfu\\.gov\\.ua/[a-z]{2}/[\\w\\-]+-\\d+/"]
+   deny: ["/category/", "/tag/", "\\.(pdf|jpg|png)$"]
+   keywords: ["ветеран", "пільг", "виплат", "субсид"]
+   title_selector: "h1"
+
+ - name: "МОЗ"
+   base: "https://moz.gov.ua"
+   start_urls: ["https://moz.gov.ua/uk"]
+   allow: ["^https?://moz\\.gov\\.ua/uk/[\\w\\-/]+"]
+   deny: ["/category/", "/tag/", "\\.(pdf|jpg|png)$"]
+   keywords: ["ветеран", "реабілітац", "нсзу"]
+   title_selector: "h1"
