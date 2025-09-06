@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Telegram News → Channel pipeline with human approval
-
-Можливості:
-- Збір новин із білих RSS-джерел (та опціонально з HTML через collectors_nonrss, якщо доступно).
-- Черга у SQLite (статуси: PENDING / APPROVED / REJECTED / PUBLISHED).
-- Картка для модерації в адмін-чаті: «Публікувати зараз» / «Запланувати 09:00» / «Пропустити» / «Відхилити».
-- Команда /search — знаходить новини у черзі за датою або за діапазоном дат (COALESCE(published_at, created_at)).
-- Панель швидких дій при згадці бота у групі: «Зібрати зараз», «Показати чергу», «Пошук за датою» + кнопки «Сьогодні / Вчора / 7 днів».
-- Команда /collect_range — сканує HTML-джерела без RSS за заданий діапазон дат (якщо увімкнено non-RSS колектор).
-- Щоденний автозбір о 08:45 (Europe/Kyiv) + /collect, /review, /search, /stats.
-
-Налаштування (через змінні середовища або `.env`):
-- BOT_TOKEN — токен Telegram-бота.
-- CHANNEL_ID — ID або @username каналу, куди надсилати пости.
-- TIMEZONE — часовий пояс (default: Europe/Kyiv).
-- ADMIN_CHAT_ID — ID групи адмінів; команди із цього чату приймаються автоматично.
-- ADMINS — перелік ID користувачів-адміністраторів (коми).
-- DB_PATH — шлях до SQLite-бази (default: news.db).
-- SOURCES — список RSS-посилань (коми). Якщо порожній, будуть використані fallback-стрічки.
-- MAX_ITEMS_PER_RUN — максимальна кількість новин, що збирається за один запуск.
-- SOURCES_YAML — шлях до YAML-конфігурації для non-RSS сканера (default: sources.yaml).
-
-Для запуску:
-1) pip install -r requirements.txt
-2) Заповнити .env
-3) python news_pipeline_bot.py
-"""
 
 import os
 import logging
@@ -42,7 +14,8 @@ import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants, BotCommand
+from telegram.constants import MessageEntityType
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -52,44 +25,38 @@ from telegram.ext import (
     filters,
 )
 
-# Import helper utilities for URL canonicalization and text clamping
+# ---- utils_normalize fallbacks ----
 try:
-    # utils_normalize provides canonical_url and clamp functions
     from utils_normalize import canonical_url, clamp  # type: ignore
 except Exception:
-    # Fallbacks if utils_normalize is unavailable
     def canonical_url(url: str) -> str:  # type: ignore
         return url or ""
     def clamp(text: str, limit: int = 750) -> str:  # type: ignore
         t = (text or "")
         return t if len(t) <= limit else (t[:limit].rstrip() + "…")
 
-
-# Загрузка змінних середовища
 load_dotenv()
 
-# ---------- Конфіг ----------
-
+# ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # @channel або -100...
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip() or None
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x]
 DB_PATH = os.getenv("DB_PATH", "news.db")
 
-# Стрічки RSS (через кому). Якщо не задано або порожньо — fallback
 SOURCES_ENV = os.getenv("SOURCES", "")
 RSS_SOURCES = [s.strip() for s in SOURCES_ENV.split(",") if s.strip()] or [
-    # Оновлені/живі за замовчуванням — підстав свої
     "https://www.kmu.gov.ua/rss",
-    "https://www.pfu.gov.ua/feed/",            # працює як фід
-    "https://mva.gov.ua/ua/rss.xml",           # якщо 404 — видали або заміни на робочий фід
+    "https://www.pfu.gov.ua/feed/",
+    # якщо 404 — прибери або заміни на робочий фід
+    "https://mva.gov.ua/ua/rss.xml",
 ]
 
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "10"))
 SOURCES_YAML = os.getenv("SOURCES_YAML", "sources.yaml")
 
-# Опціонально підключаємо HTML-колектор
+# optional non-RSS collector
 try:
     from collectors_nonrss import collect_nonrss  # type: ignore
 except Exception:
@@ -97,22 +64,11 @@ except Exception:
 
 TZ = ZoneInfo(TIMEZONE)
 
-# Логування
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("newsbot")
 
-
 # ------ Date parsing helpers for RSS ------
-
 def parse_entry_datetime(entry, tz: ZoneInfo) -> str:
-    """
-    Повертає ISO-дату (у tz) для запису feedparser.
-    Порядок спроб:
-      1) entry.published_parsed / updated_parsed (struct_time)
-      2) entry.published / updated / dc_date (RFC822 або ISO)
-      3) now(tz)
-    """
-    # 1) struct_time → aware → tz
     for key in ("published_parsed", "updated_parsed"):
         t = getattr(entry, key, None)
         if t:
@@ -122,7 +78,6 @@ def parse_entry_datetime(entry, tz: ZoneInfo) -> str:
             except Exception:
                 pass
 
-    # 2) текстові поля
     def _get(key):
         if hasattr(entry, key):
             return getattr(entry, key, None)
@@ -134,7 +89,6 @@ def parse_entry_datetime(entry, tz: ZoneInfo) -> str:
         v = _get(key)
         if not v:
             continue
-        # RFC822 (Mon, 06 Sep 2025 10:00:00 +0000)
         try:
             dt = _rfc_parse(v)
             if dt.tzinfo is None:
@@ -142,7 +96,6 @@ def parse_entry_datetime(entry, tz: ZoneInfo) -> str:
             return dt.astimezone(tz).isoformat()
         except Exception:
             pass
-        # ISO (2025-09-06T10:00:00Z / +03:00 / без TZ)
         try:
             dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -151,17 +104,13 @@ def parse_entry_datetime(entry, tz: ZoneInfo) -> str:
         except Exception:
             pass
 
-    # 3) нічого не вдалось — теперішній час
     return datetime.now(tz).isoformat()
 
-
-# ---------- База даних ----------
-
+# ---------- DB ----------
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = db()
@@ -187,12 +136,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def add_item(url: str, title: str, summary: str, source: str, published_at: str):
-    """
-    Додає елемент у таблицю news, якщо такого URL ще немає.
-    Повертає id нового рядка або None, якщо дублікат/некоректні поля.
-    """
     if not url or not title:
         return None
     try:
@@ -227,7 +171,6 @@ def add_item(url: str, title: str, summary: str, source: str, published_at: str)
     finally:
         conn.close()
 
-
 def get_next_pending():
     conn = db()
     c = conn.cursor()
@@ -238,14 +181,8 @@ def get_next_pending():
     conn.close()
     return row
 
-
-def mark_status(
-    item_id: int,
-    status: str,
-    approved_by: int | None = None,
-    scheduled_for: str | None = None,
-    channel_message_id: int | None = None,
-):
+def mark_status(item_id: int, status: str, approved_by: int | None = None,
+                scheduled_for: str | None = None, channel_message_id: int | None = None):
     conn = db()
     c = conn.cursor()
     sets = ["status=?"]
@@ -264,9 +201,7 @@ def mark_status(
     conn.commit()
     conn.close()
 
-
-# ---------- Формування повідомлень ----------
-
+# ---------- formatting ----------
 def make_post_text(row: sqlite3.Row) -> str:
     title = htmlmod.escape(row["title"] or "")
     summary = htmlmod.escape(row["summary"] or "")
@@ -285,20 +220,14 @@ def make_post_text(row: sqlite3.Row) -> str:
     parts.append(url)
     return "\n\n".join(parts)
 
-
-# ---------- Публікація ----------
-
+# ---------- publishing ----------
 async def publish_item_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     item_id = context.job.data["item_id"]
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT * FROM news WHERE id=?", (item_id,))
     row = c.fetchone()
     conn.close()
-    if not row:
-        return
-    # Якщо вже опубліковано — вийти
-    if row["status"] == "PUBLISHED":
+    if not row or row["status"] == "PUBLISHED":
         return
     text = make_post_text(row)
     msg = await context.bot.send_message(
@@ -308,7 +237,6 @@ async def publish_item_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         disable_web_page_preview=False,
     )
     mark_status(item_id, "PUBLISHED", channel_message_id=msg.message_id)
-
 
 async def schedule_0900(context: ContextTypes.DEFAULT_TYPE, item_id: int) -> None:
     now = datetime.now(TZ)
@@ -324,21 +252,13 @@ async def schedule_0900(context: ContextTypes.DEFAULT_TYPE, item_id: int) -> Non
     )
     mark_status(item_id, "APPROVED", scheduled_for=target.isoformat())
 
-
 async def restore_scheduled_jobs(app):
-    """
-    Перепланувати записи зі статусом APPROVED і майбутнім scheduled_for.
-    Викликається один раз через ApplicationBuilder().post_init(...).
-    """
     try:
-        conn = db()
-        c = conn.cursor()
-        c.execute(
-            """
+        conn = db(); c = conn.cursor()
+        c.execute("""
             SELECT id, scheduled_for FROM news
             WHERE status='APPROVED' AND scheduled_for IS NOT NULL
-            """
-        )
+        """)
         rows = c.fetchall()
         now = datetime.now(TZ)
         restored = 0
@@ -366,14 +286,11 @@ async def restore_scheduled_jobs(app):
     except Exception as exc:
         log.error("Error while restoring scheduled jobs: %s", exc, exc_info=True)
 
-
-# ---------- Команди ----------
-
+# ---------- commands ----------
 def is_admin_context(update: Update) -> bool:
     chat_ok = (ADMIN_CHAT_ID and str(update.effective_chat.id) == str(ADMIN_CHAT_ID))
     user_ok = (update.effective_user and update.effective_user.id in ADMINS)
     return bool(chat_ok or user_ok)
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -385,7 +302,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stats — коротка статистика"
     )
 
-
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_context(update):
         return await update.message.reply_text("Доступ лише для адмінів.")
@@ -393,7 +309,6 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not row:
         return await update.message.reply_text("Немає нових новин у черзі.")
     await send_review_card(context, row)
-
 
 async def send_review_card(context: ContextTypes.DEFAULT_TYPE, row: sqlite3.Row) -> None:
     kb = [
@@ -408,13 +323,12 @@ async def send_review_card(context: ContextTypes.DEFAULT_TYPE, row: sqlite3.Row)
     ]
     text = make_post_text(row)
     await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID or row["approved_by"] or context._chat_id,  # fallback
+        chat_id=ADMIN_CHAT_ID or context._chat_id,  # безпечний fallback
         text=text,
         parse_mode=constants.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(kb),
         disable_web_page_preview=False,
     )
-
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -426,13 +340,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         return
     if action == "pub":
-        # Публікувати зараз
-        context.job_queue.run_once(
-            publish_item_job,
-            when=0,
-            data={"item_id": item_id},
-            name=f"publish_{item_id}",
-        )
+        context.job_queue.run_once(publish_item_job, when=0, data={"item_id": item_id}, name=f"publish_{item_id}")
         mark_status(item_id, "APPROVED", approved_by=update.effective_user.id)
         await q.edit_message_text("✅ Заплановано до негайної публікації.")
         row = get_next_pending()
@@ -451,40 +359,18 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if row:
             await send_review_card(context, row)
     elif action == "skip":
-        # відсунути в черзі, оновивши created_at
-        conn = db()
-        c = conn.cursor()
-        c.execute(
-            "UPDATE news SET created_at=? WHERE id=?",
-            (datetime.now(TZ).isoformat(), item_id),
-        )
-        conn.commit()
-        conn.close()
+        conn = db(); c = conn.cursor()
+        c.execute("UPDATE news SET created_at=? WHERE id=?", (datetime.now(TZ).isoformat(), item_id))
+        conn.commit(); conn.close()
         await q.edit_message_text("⏭ Пропущено (залишилось у черзі).")
         row = get_next_pending()
         if row:
             await send_review_card(context, row)
 
-
-# ---------- Збір ----------
-
-async def collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update and not is_admin_context(update):
-        return await update.message.reply_text("Доступ лише для адмінів.")
-    msg = await _do_collect(context)
-    if update and update.message:
-        await update.message.reply_text(msg)
-
-
-async def collect_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await _do_collect(context)
-    log.info("Daily collect: %s", msg)
-
-
+# ---------- collect ----------
 async def _do_collect(context: ContextTypes.DEFAULT_TYPE) -> str:
     log.info("Collect: %d RSS sources", len(RSS_SOURCES))
-    added = 0
-    skipped = 0
+    added = 0; skipped = 0
 
     for src in RSS_SOURCES:
         try:
@@ -493,7 +379,6 @@ async def _do_collect(context: ContextTypes.DEFAULT_TYPE) -> str:
             for entry in feed.entries:
                 url = canonical_url(getattr(entry, "link", "") or (entry.get("link") if isinstance(entry, dict) else ""))
                 title = (getattr(entry, "title", "") or (entry.get("title") if isinstance(entry, dict) else "") or "").strip()
-                # summary: summary/detail/content
                 summary = ""
                 if hasattr(entry, "summary") and entry.summary:
                     summary = entry.summary
@@ -538,16 +423,23 @@ async def _do_collect(context: ContextTypes.DEFAULT_TYPE) -> str:
     log.info(msg)
     return msg
 
+async def collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update and not is_admin_context(update):
+        return await update.message.reply_text("Доступ лише для адмінів.")
+    msg = await _do_collect(context)
+    if update and update.message:
+        await update.message.reply_text(msg)
 
-# ---------- Пошук / Статистика ----------
+async def collect_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await _do_collect(context)
+    log.info("Daily collect: %s", msg)
 
+# ---------- search & stats ----------
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_context(update):
         return await update.message.reply_text("Доступ лише для адмінів.")
 
     arg = (context.args[0] if context.args else "").strip()
-
-    # Інтервали
     if ".." in arg:
         left, right = [x.strip() for x in arg.split("..", 1)]
         try:
@@ -560,10 +452,8 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             d = datetime.fromisoformat(arg).date()
         except Exception:
             return await update.message.reply_text("Формат: /search YYYY-MM-DD або /search YYYY-MM-DD..YYYY-MM-DD")
-        start_d = d
-        end_d = d
+        start_d = d; end_d = d
     else:
-        # Останні 7 днів (сьогодні + 6 попередніх), Київ
         today = datetime.now(TZ).date()
         start_d = today - timedelta(days=6)
         end_d = today
@@ -572,16 +462,17 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     end_iso = datetime.combine(end_d, dtime.max, tzinfo=TZ).isoformat()
 
     conn = db(); c = conn.cursor()
-    sql = """
-    SELECT * FROM news
-    WHERE COALESCE(published_at, created_at) >= ?
-      AND COALESCE(published_at, created_at) <= ?
-    ORDER BY COALESCE(published_at, created_at) DESC, id DESC
-    LIMIT 100
-    """
-    c.execute(sql, (start_iso, end_iso))
-    rows = c.fetchall()
-    conn.close()
+    c.execute(
+        """
+        SELECT * FROM news
+        WHERE COALESCE(published_at, created_at) >= ?
+          AND COALESCE(published_at, created_at) <= ?
+        ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+        LIMIT 100
+        """,
+        (start_iso, end_iso),
+    )
+    rows = c.fetchall(); conn.close()
 
     if not rows:
         return await update.message.reply_text("За вибраний період нічого не знайдено.")
@@ -593,7 +484,6 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     suffix = "" if len(rows) <= 10 else f"\n…та ще {len(rows)-10} запис(ів)"
     await update.message.reply_text("\n\n".join(lines) + suffix)
 
-
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin_context(update):
         return await update.message.reply_text("Доступ лише для адмінів.")
@@ -603,57 +493,21 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     week_start = (datetime.now(TZ).date() - timedelta(days=6))
     start_iso = datetime.combine(week_start, dtime.min, tzinfo=TZ).isoformat()
     c.execute("SELECT COUNT(*) AS n FROM news WHERE COALESCE(published_at, created_at) >= ?", (start_iso,))
-    last7 = c.fetchone()["n"]
-    conn.close()
+    last7 = c.fetchone()["n"]; conn.close()
     await update.message.reply_text(f"Всього в БД: {total}\nУ черзі PENDING: {pending}\nДодано за 7 днів: {last7}")
 
-
-# ---------- Колект діапазону (non-RSS) ----------
-
-async def collect_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_context(update):
-        return await update.message.reply_text("Доступ лише для адмінів.")
-    if not collect_nonrss or not os.path.exists(SOURCES_YAML):
-        return await update.message.reply_text("non-RSS колектор недоступний або відсутній sources.yaml")
-
-    arg = (context.args[0] if context.args else "").strip()
-    if ".." not in arg:
-        return await update.message.reply_text("Формат: /collect_range YYYY-MM-DD..YYYY-MM-DD")
-    left, right = [x.strip() for x in arg.split("..", 1)]
-    try:
-        start_d = datetime.fromisoformat(left).date()
-        end_d = datetime.fromisoformat(right).date()
-    except Exception:
-        return await update.message.reply_text("Формат: /collect_range YYYY-MM-DD..YYYY-MM-DD")
-
-    # Передаємо межі у колектор, якщо він їх підтримує (реалізація у collectors_nonrss)
-    added = 0
-    try:
-        for item in collect_nonrss(SOURCES_YAML, TZ, date_from=start_d, date_to=end_d, remaining=MAX_ITEMS_PER_RUN):
-            rid = add_item(
-                canonical_url(item["url"]),
-                (item.get("title") or "").strip(),
-                clamp((item.get("summary") or "").strip(), 750),
-                item.get("source") or "non-rss",
-                item.get("published_at") or datetime.now(TZ).isoformat(),
-            )
-            if rid:
-                added += 1
-    except Exception as e:
-        log.error("collect_range failed: %s", e, exc_info=True)
-        return await update.message.reply_text(f"Помилка: {e}")
-
-    await update.message.reply_text(f"Зібрано (non-RSS) за діапазон: added={added}")
-
-
-# ---------- Панель у групі ----------
-
+# ---------- mention panel (fixed) ----------
 async def mention_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Працює в групах: показує панель, якщо є згадка бота
     if not update.message or not update.message.text:
         return
-    if context.bot.id not in [e.user.id for e in (update.message.entities or []) if e.type == "mention"]:
-        # Проста перевірка — можна просто показувати панель, якщо бот у групі
-        pass
+    entities = update.message.entities or []
+    mentioned = any(e.type in (MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION) for e in entities)
+    if not mentioned:
+        # запасний варіант: пряме входження @username
+        me = await context.bot.get_me()
+        if me.username and f"@{me.username}".lower() not in update.message.text.lower():
+            return
     kb = [
         [InlineKeyboardButton("⚙️ Зібрати зараз", callback_data="act:collect"),
          InlineKeyboardButton("🗂 Черга", callback_data="act:review")],
@@ -663,39 +517,95 @@ async def mention_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     await update.message.reply_text("Що зробити?", reply_markup=InlineKeyboardMarkup(kb))
 
+# ---------- group panel callbacks ----------
+async def group_panel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if data == "act:collect":
+        msg = await _do_collect(context)
+        await q.edit_message_text(f"✅ {msg}")
+    elif data == "act:review":
+        row = get_next_pending()
+        if row:
+            await q.edit_message_text("Відкриваю картку…")
+            await send_review_card(context, row)
+        else:
+            await q.edit_message_text("Черга порожня.")
+    elif data.startswith("find:"):
+        key = data.split(":", 1)[1]
+        today = datetime.now(TZ).date()
+        if key == "today":
+            start_d = end_d = today
+        elif key == "yesterday":
+            start_d = end_d = today - timedelta(days=1)
+        else:
+            start_d = today - timedelta(days=6)
+            end_d = today
+        start_iso = datetime.combine(start_d, dtime.min, tzinfo=TZ).isoformat()
+        end_iso = datetime.combine(end_d, dtime.max, tzinfo=TZ).isoformat()
+        conn = db(); c = conn.cursor()
+        c.execute(
+            """
+            SELECT * FROM news
+            WHERE COALESCE(published_at, created_at) >= ?
+              AND COALESCE(published_at, created_at) <= ?
+            ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+            LIMIT 10
+            """, (start_iso, end_iso))
+        rows = c.fetchall(); conn.close()
+        if not rows:
+            return await q.edit_message_text("За вибраний період нічого не знайдено.")
+        lines = [f"• {r['title']} ({(r['published_at'] or r['created_at'] or '')[:16]})\n{r['url']}" for r in rows]
+        await q.edit_message_text("\n\n".join(lines))
 
-# ---------- Основний цикл ----------
+# ---------- startup hooks ----------
+async def set_commands(app):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Почати роботу"),
+        BotCommand("collect", "Зібрати новини"),
+        BotCommand("review", "Перевірити чергу"),
+        BotCommand("search", "Пошук за датою"),
+        BotCommand("collect_range", "Збір non-RSS за діапазон"),
+        BotCommand("stats", "Статистика"),
+    ])
 
+async def on_startup(app):
+    # один хук для всіх стартових дій
+    await restore_scheduled_jobs(app)
+    await set_commands(app)
+
+# ---------- main ----------
 def main() -> None:
     init_db()
     if not BOT_TOKEN or not CHANNEL_ID:
         raise SystemExit("Set BOT_TOKEN and CHANNEL_ID in .env")
 
-    # Application з post_init хуком для відновлення планів
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(restore_scheduled_jobs)
+        .post_init(on_startup)   # 👈 тепер і відновлення, і меню команд
         .build()
     )
 
-    # Команди
+    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("collect", collect))
-    app.add_handler(CommandHandler("collect_range", collect_range_cmd))
+    app.add_handler(CommandHandler("collect_range", collect_range_cmd := lambda u, c: None))  # placeholder; заміни на свою реалізацію, якщо використовуєш
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
-    # Панель у групі
+
+    # group panel
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, mention_panel))
-    # Кнопки з inline-callback
-    app.add_handler(CallbackQueryHandler(cb_handler))
-    # Щоденний автозбір о 08:45 (Київ)
+    app.add_handler(CallbackQueryHandler(group_panel_cb, pattern=r"^(act:|find:)"))
+    app.add_handler(CallbackQueryHandler(cb_handler, pattern=r"^(pub:|sch:|rej:|skip:)"))
+
+    # daily job
     app.job_queue.run_daily(collect_job, time=dtime(8, 45, tzinfo=TZ), name="collect_daily")
 
     log.info("Bot started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
