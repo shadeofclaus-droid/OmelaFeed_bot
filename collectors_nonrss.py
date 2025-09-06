@@ -1,166 +1,283 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Generic HTML news collector without RSS.
+
+This module defines a flexible scraper that extracts news entries from
+arbitrary websites using CSS selectors defined in a YAML configuration.
+It supports basic rate limiting per source, unique URL filtering and
+optional date range filtering. Extracted entries are returned as
+dictionaries with keys: url, title, summary, source, published_at.
+
+Example YAML (sources.yaml) structure:
+
+```
+sources:
+  - name: "Мінсоцполітики — новини"
+    list_urls:
+      - "https://www.msp.gov.ua/press-center/news"
+    link_selector: "a[href*='/news/']"
+    max_per_source: 10
+    detail:
+      title_selectors: ["h1", ".page-title"]
+      summary_selectors: ["article p", ".content p"]
+      date_selectors: ["time[datetime]", ".date"]
+      date_attr: "datetime"
+```
+
+The collector will visit each list_url, find all links matching
+link_selector and then fetch each article page to extract title,
+summary and published date based on the provided selectors. If
+`date_from` or `date_to` arguments are provided, entries outside that
+range are skipped.
+
+"""
 from __future__ import annotations
-import re, time, json, logging
+
+import random
+import time
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urldefrag
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from typing import Iterable, List, Optional, Dict
+from urllib.parse import urljoin, urlparse
 
-import requests, yaml
+import requests
 from bs4 import BeautifulSoup
-from readability import Document
-import urllib.robotparser as robotparser
+from dateutil import parser as dateparser
+import yaml
 
-from utils_normalize import canonical_url, parse_ua_date, clamp
+# Use a session for connection reuse and header customization
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        ),
+        "Accept-Language": "uk,ru;q=0.8,en;q=0.6",
+    }
+)
 
-TZ = ZoneInfo("Europe/Kyiv")
-UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124 Safari/537.36 (news-bot)")
-
-log = logging.getLogger("nonrss")
-logging.basicConfig(level=logging.INFO)
+# Utility dataclasses to describe source configuration
 
 @dataclass
-class Site:
+class DetailRules:
+    title_selectors: List[str] = field(default_factory=list)
+    summary_selectors: List[str] = field(default_factory=list)
+    date_selectors: List[str] = field(default_factory=list)
+    date_attr: Optional[str] = None
+    date_formats: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SourceCfg:
     name: str
-    base: str
-    start_urls: list[str]
-    allow: list[str]
-    deny: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
-    title_selector: str | None = None
-    summary_selector: str | None = None
-    date_selector: str | None = None
-
-    def allowed(self, href: str) -> bool:
-        if not href: return False
-        u = canonical_url(urldefrag(href)[0])
-        if any(re.search(rx, u) for rx in self.deny):
-            return False
-        return any(re.search(rx, u) for rx in self.allow)
+    list_urls: List[str]
+    link_selector: str
+    base_url: Optional[str] = None
+    sleep: float = 0.7
+    max_per_source: int = 10
+    detail: DetailRules = field(default_factory=DetailRules)
 
 
-def load_sites_from_yaml(path: str) -> list[Site]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or []
-    return [Site(**row) for row in raw]
-
-
-def robots_ok(site: Site, url: str) -> bool:
+def _get(url: str) -> Optional[BeautifulSoup]:
+    """Fetch a URL and return a BeautifulSoup document or None on error."""
     try:
-        rp = robotparser.RobotFileParser()
-        rp.set_url(urljoin(site.base, "/robots.txt"))
-        rp.read()
-        return rp.can_fetch(UA, url)
+        resp = SESSION.get(url, timeout=15)
+        if resp.status_code >= 400:
+            return None
+        return BeautifulSoup(resp.text, "html.parser")
     except Exception:
-        return True
+        return None
 
 
-def session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "uk,ru;q=0.8,en;q=0.7"})
-    adapter = requests.adapters.HTTPAdapter(max_retries=3)
-    s.mount("http://", adapter); s.mount("https://", adapter)
-    return s
+def _abs(base: str, href: str) -> str:
+    return urljoin(base, href)
 
 
-def extract_links(html_text: str, base: str) -> list[str]:
-    soup = BeautifulSoup(html_text, "lxml")
-    out = []
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        if not href or href.startswith("#"): continue
-        if href.startswith("/"): href = urljoin(base, href)
-        out.append(canonical_url(urldefrag(href)[0]))
-    return list(dict.fromkeys(out))
+def _text_of(node) -> str:
+    if not node:
+        return ""
+    return " ".join(node.stripped_strings)
 
 
-def extract_meta_date(soup: BeautifulSoup) -> str | None:
-    for sel in [
-        'meta[property="article:published_time"]',
-        'meta[property="og:updated_time"]',
-        'meta[name="pubdate"]',
-        'time[datetime]'
-    ]:
-        el = soup.select_one(sel)
-        if el:
-            dt = el.get("content") or el.get("datetime")
+# Common meta tags used to store publication dates
+META_DATE_SELECTORS = [
+    ("meta", {"property": "article:published_time"}, "content"),
+    ("meta", {"name": "article:published_time"}, "content"),
+    ("meta", {"property": "og:article:published_time"}, "content"),
+    ("meta", {"name": "pubdate"}, "content"),
+    ("meta", {"itemprop": "datePublished"}, "content"),
+    ("time", {}, "datetime"),
+]
+
+
+def _parse_date_any(value: str) -> Optional[datetime]:
+    """Parse a date string using dateutil; return None on failure."""
+    try:
+        return dateparser.parse(value)
+    except Exception:
+        return None
+
+
+def _extract_date(doc: BeautifulSoup, rules: DetailRules) -> Optional[datetime]:
+    """Try to extract a date from meta tags or custom selectors."""
+    # 1) meta/time tags
+    for tag, attrs, attr in META_DATE_SELECTORS:
+        el = doc.find(tag, attrs=attrs)
+        if el and el.get(attr):
+            dt = _parse_date_any(el.get(attr))
             if dt:
-                try:
-                    return datetime.fromisoformat(dt.replace("Z","+00:00")).astimezone(TZ).isoformat()
-                except Exception:
-                    pass
-    return parse_ua_date(soup.get_text(" "))
+                return dt
+    # 2) custom selectors from config
+    for css in rules.date_selectors:
+        el = doc.select_one(css)
+        if not el:
+            continue
+        if rules.date_attr and el.get(rules.date_attr):
+            dt = _parse_date_any(el.get(rules.date_attr))
+        else:
+            dt = _parse_date_any(_text_of(el))
+        if dt:
+            return dt
+    return None
 
 
-def extract_article(html_text: str, url: str, site: Site) -> tuple[str, str]:
-    soup_full = BeautifulSoup(html_text, "lxml")
-    if site.title_selector:
-        h = soup_full.select_one(site.title_selector)
-        title = (h.get_text(" ").strip() if h else "")
-    else:
-        title = Document(html_text).short_title() or ""
-
-    if site.summary_selector:
-        body = soup_full.select_one(site.summary_selector)
-        summary = clamp(body.get_text(" ").strip()) if body else ""
-    else:
-        content_html = Document(html_text).summary(html_partial=True)
-        soup = BeautifulSoup(content_html, "lxml")
-        summary = clamp(soup.get_text(" ").strip())
-    return title, summary
+def _extract_title(doc: BeautifulSoup, rules: DetailRules) -> str:
+    for css in rules.title_selectors or ["h1", "h1.entry-title", "h1.article-title"]:
+        el = doc.select_one(css)
+        if el:
+            return _text_of(el)
+    og = doc.find("meta", {"property": "og:title"})
+    if og and og.get("content"):
+        return og["content"]
+    return ""
 
 
-def collect_site(site: Site, max_items: int, sess: requests.Session) -> list[dict]:
-    items, seen = [], set()
-    for start in site.start_urls:
-        try:
-            if not robots_ok(site, start):
-                log.info("robots disallow: %s", start); continue
-            r = sess.get(start, timeout=25)
-            if r.status_code != 200: continue
-            for href in extract_links(r.text, site.base):
-                if href in seen: continue
-                seen.add(href)
-                if not site.allowed(href): continue
-                if not robots_ok(site, href): continue
-                rr = sess.get(href, timeout=30)
-                if rr.status_code != 200: continue
-                soup = BeautifulSoup(rr.text, "lxml")
-                text_all = soup.get_text(" ").lower()
-                if site.keywords and not any(k in text_all for k in site.keywords):
-                    continue
-                title, summary = extract_article(rr.text, href, site)
-                pub = None
-                if site.date_selector:
-                    el = soup.select_one(site.date_selector)
-                    if el:
-                        pub = extract_meta_date(BeautifulSoup(str(el), "lxml"))
-                if not pub:
-                    pub = extract_meta_date(soup)
-                items.append({
-                    "url": href,
-                    "title": title or "",
-                    "summary": summary or "",
-                    "source": site.name,
-                    "published_at": pub or datetime.now(TZ).isoformat(),
-                })
-                if len(items) >= max_items: return items
-                time.sleep(0.8)
-        except Exception as e:
-            log.warning("%s: %s", site.name, e)
-    return items
+def _extract_summary(doc: BeautifulSoup, rules: DetailRules) -> str:
+    for css in rules.summary_selectors or ["article p", ".entry-content p", ".article-content p"]:
+        el = doc.select_one(css)
+        if el:
+            return _text_of(el)
+    md = doc.find("meta", {"name": "description"})
+    if md and md.get("content"):
+        return md["content"]
+    return ""
 
 
-def collect_nonrss(config_path: str = "sources.yaml", max_items_total: int = 15) -> list[dict]:
-    sites = load_sites_from_yaml(config_path)
-    sess = session()
-    per_site = max(1, max_items_total // max(1, len(sites)))
+def _pick_links(list_url: str, link_selector: str, base_url: Optional[str]) -> List[str]:
+    doc = _get(list_url)
+    if not doc:
+        return []
+    links = []
+    for a in doc.select(link_selector):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = _abs(base_url or list_url, href)
+        # ignore anchors and obvious pagination
+        if "#" in full:
+            full = full.split("#")[0]
+        if not full:
+            continue
+        links.append(full)
+    # unique while preserving order
+    seen = set()
     out = []
-    for st in sites:
-        out.extend(collect_site(st, per_site, sess))
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
     return out
 
-if __name__ == "__main__":
-    print(json.dumps(collect_nonrss("sources.yaml", 12), ensure_ascii=False, indent=2))
+
+def _extract_article(url: str, rules: DetailRules, tz) -> Optional[Dict]:
+    doc = _get(url)
+    if not doc:
+        return None
+    title = _extract_title(doc, rules).strip()
+    summary = _extract_summary(doc, rules).strip()
+    dt = _extract_date(doc, rules)
+    if not dt:
+        dt = datetime.utcnow()
+    # timezone-aware
+    if not dt.tzinfo:
+        dt = dt.replace(tzinfo=dateparser.tz.UTC)
+    published_at = dt.astimezone(tz).isoformat()
+    return {
+        "url": url,
+        "title": title or "Без назви",
+        "summary": summary,
+        "source": urlparse(url).netloc,
+        "published_at": published_at,
+    }
+
+
+def _within_range(iso_ts: str, date_from: Optional[datetime], date_to: Optional[datetime]) -> bool:
+    if not (date_from or date_to):
+        return True
+    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    if date_from and dt < date_from:
+        return False
+    if date_to and dt >= date_to:
+        return False
+    return True
+
+
+def collect_nonrss(
+    yaml_path: str,
+    tz,
+    remaining: int = 20,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> Iterable[Dict]:
+    """
+    Iterate through configured sources and yield article dictionaries.
+
+    Args:
+        yaml_path: path to YAML config with a `sources` key.
+        tz: timezone object for published_at conversion.
+        remaining: maximum number of items to return overall.
+        date_from: lower inclusive bound (aware datetime) or None.
+        date_to: upper exclusive bound (aware datetime) or None.
+    Yields:
+        dicts with keys: url, title, summary, source, published_at
+    """
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    sources_cfg = cfg.get("sources", [])
+    count = 0
+    for src_cfg in sources_cfg:
+        src = SourceCfg(
+            name=src_cfg.get("name", ""),
+            list_urls=src_cfg.get("list_urls") or [],
+            link_selector=src_cfg.get("link_selector") or "",
+            base_url=src_cfg.get("base_url"),
+            sleep=float(src_cfg.get("sleep", 0.7)),
+            max_per_source=int(src_cfg.get("max_per_source", 10)),
+            detail=DetailRules(
+                title_selectors=src_cfg.get("detail", {}).get("title_selectors", []),
+                summary_selectors=src_cfg.get("detail", {}).get("summary_selectors", []),
+                date_selectors=src_cfg.get("detail", {}).get("date_selectors", []),
+                date_attr=src_cfg.get("detail", {}).get("date_attr"),
+                date_formats=src_cfg.get("detail", {}).get("date_formats", []),
+            ),
+        )
+        per_source = 0
+        for list_url in src.list_urls:
+            for link in _pick_links(list_url, src.link_selector, src.base_url):
+                art = _extract_article(link, src.detail, tz)
+                if not art:
+                    continue
+                if not _within_range(art["published_at"], date_from, date_to):
+                    continue
+                yield art
+                count += 1
+                per_source += 1
+                if count >= remaining or per_source >= src.max_per_source:
+                    break
+                time.sleep(src.sleep + random.random() * 0.3)
+            if count >= remaining or per_source >= src.max_per_source:
+                break
+        if count >= remaining:
+            break
