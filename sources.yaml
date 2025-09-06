@@ -1,50 +1,73 @@
-sources:
-  # Міністерство соціальної політики — новини
-  - name: "Мінсоцполітики — новини"
-    list_urls:
-      - "https://www.msp.gov.ua/press-center/news"
-    link_selector: "a[href*='/news/'], .news-list a, .views-row a"
-    max_per_source: 10
-    detail:
-      title_selectors: ["h1", ".article-title", ".page-title"]
-      summary_selectors: [".article-body p", ".field--name-body p", "article p"]
-      date_selectors: ["time[datetime]", ".date", ".published", ".article-date"]
-      date_attr: "datetime"
+# sources.yaml
 
-  # Міністерство у справах ветеранів — новини
-  - name: "Мінветеранів — новини"
-    # The original path /ua/news returns 404 as of September 2025. Use the category
-    # listing page instead. Article links reside under /prescenter/category/86-novini.
-    list_urls:
-      - "https://mva.gov.ua/category/86-novini"
-    # Pick up article links from the veterans news category. We target the
-    # /prescenter/category/ path to avoid unrelated pages.
-    link_selector: "a[href*='/prescenter/category/']"
-    max_per_source: 10
-    detail:
-      # On article pages, the title is typically in an <h1> element or has
-      # specific page-title classes.
-      title_selectors: ["h1", ".page-title", ".node__title"]
-      # Extract the first paragraph of the article body.
-      summary_selectors: ["article p", ".content p", ".node__content p"]
-      # Try to fetch publication date from a time tag or meta property. If not
-      # available, the collector will fall back to meta tags defined in collectors_nonrss.
-      date_selectors: ["time[datetime]", "meta[property='article:published_time']", ".field--name-created", ".date", ".published"]
-      date_attr: "datetime"
+# Міністерство у справах ветеранів України — категорія "Новини"
+- name: "Мінветеранів — новини"
+  list_urls:
+    - "https://mva.gov.ua/category/86-novini"
+  link_selector: "a[href*='/prescenter/category/']"
+  max_per_source: 10
+  detail:
+    title_selectors: ["h1", ".page-title", ".node__title"]
+    summary_selectors: ["article p", ".content p", ".node__content p"]
+    date_selectors: ["time[datetime]", "meta[property='article:published_time']", ".field--name-created", ".date", ".published"]
+    date_attr: "datetime"
 
-  # Пенсійний фонд України — новини
-  - name: "ПФУ — новини"
-    # The news section moved under /prestsentr/novini as of September 2025
-    list_urls:
-      - "https://www.pfu.gov.ua/prestsentr/novini/"
-    link_selector: "article a, .news-item a, a[href*='/novini/']"
-    max_per_source: 10
-    detail:
-      title_selectors: ["h1.entry-title", "h1", ".post-title"]
-      summary_selectors: [".entry-content p", "article p", ".post-content p"]
-      date_selectors: ["time[datetime]", "time[content]", ".post-date", ".entry-date"]
-      date_attr: "datetime"
+# Урядовий портал — тег "ветерани"
+- name: "КМУ — ветерани (тег)"
+  list_urls:
+    - "https://www.kmu.gov.ua/tags/veterany"
+  link_selector: ".news-list a, article a, a[href*='/news/']"
+  max_per_source: 8
+  detail:
+    title_selectors: ["h1", ".title", ".page-title"]
+    summary_selectors: [".desc", ".summary", "article p", ".content p"]
+    date_selectors: ["time[datetime]", ".date"]
+    date_attr: "datetime"
 
-  # Е-Ветеран сайт наразі не надає стабільної сторінки новин, тому
-  # відповідний пункт видалено. Якщо сайт пізніше отримає стрічку новин,
-  # додайте її сюди за аналогією з іншими джерелами.
+# Мінсоцполітики — новини
+- name: "Мінсоцполітики — новини"
+  list_urls:
+    - "https://www.msp.gov.ua/press-center/news"
+  link_selector: ".news-list a, article a, a[href*='/news/']"
+  max_per_source: 10
+  detail:
+    title_selectors: ["h1", ".page-title", ".title"]
+    summary_selectors: ["article p", ".content p", ".node__content p"]
+    date_selectors: ["time[datetime]", ".date", ".published"]
+    date_attr: "datetime"
+
+# Пенсійний фонд України — Пресцентр / Новини
+- name: "ПФУ — новини"
+  list_urls:
+    - "https://www.pfu.gov.ua/prestsentr/novini/"
+  link_selector: "article a, .news-item a, a[href*='/novini/']"
+  max_per_source: 10
+  detail:
+    title_selectors: ["h1.entry-title", "h1", ".post-title"]
+    summary_selectors: [".entry-content p", "article p", ".post-content p"]
+    date_selectors: ["time[datetime]", "time[content]", ".post-date", ".entry-date"]
+    date_attr: "datetime"
+
+# Дія — новини/послуги
+- name: "Дія — новини"
+  list_urls:
+    - "https://diia.gov.ua/news"
+  link_selector: ".news-list .news-item a, article a, a[href*='/news/']"
+  max_per_source: 8
+  detail:
+    title_selectors: [".news-title", "h1", ".page-title"]
+    summary_selectors: [".news-desc", ".summary", "article p", ".content p"]
+    date_selectors: ["time[datetime]", ".date"]
+    date_attr: "datetime"
+
+# МОЗ — новини
+- name: "МОЗ — новини (реабілітація/послуги)"
+  list_urls:
+    - "https://moz.gov.ua/article/news"
+  link_selector: ".news-list .news-item a, article a, a[href*='/article/news']"
+  max_per_source: 8
+  detail:
+    title_selectors: [".title", "h1", ".page-title"]
+    summary_selectors: ["article p", ".desc", ".summary"]
+    date_selectors: ["time[datetime]", ".date"]
+    date_attr: "datetime"
