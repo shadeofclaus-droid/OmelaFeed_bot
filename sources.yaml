@@ -1,44 +1,48 @@
- - name: "Мінветеранів"
-   base: "https://mva.gov.ua"
-   start_urls:
-     - "https://mva.gov.ua/category/86-novini"
-     - "https://mva.gov.ua/novini"
-   allow: ["^https?://mva\\.gov\\.ua/(prescenter|novini|news|category)/[\\w\\-/]+"]
-   deny: ["/tag/", "/page/", "\\.(pdf|jpg|png|zip)$"]
-   keywords: ["ветеран", "пільг", "послуг", "реабілітац", "житл", "uvf", "pfu"]
-   title_selector: "h1"
-   date_selector: 'meta[property="article:published_time"], time[datetime]'
+sources:
+  # Міністерство соціальної політики — новини
+  - name: "Мінсоцполітики — новини"
+    list_urls:
+      - "https://www.msp.gov.ua/press-center/news"
+    link_selector: "a[href*='/news/'], .news-list a, .views-row a"
+    max_per_source: 10
+    detail:
+      title_selectors: ["h1", ".article-title", ".page-title"]
+      summary_selectors: [".article-body p", ".field--name-body p", "article p"]
+      date_selectors: ["time[datetime]", ".date", ".published", ".article-date"]
+      date_attr: "datetime"
 
- - name: "е-Ветеран"
-   base: "https://eveteran.gov.ua"
-   start_urls: ["https://eveteran.gov.ua/"]
-   allow: ["^https?://eveteran\\.gov\\.ua/(services|materials|news)/[\\w\\-/]+"]
-   deny: ["/search"]
-   keywords: ["пільг", "статус", "послуг", "заява", "vet"]
-   title_selector: "h1"
+  # Міністерство у справах ветеранів — новини
+  - name: "Мінветеранів — новини"
+    list_urls:
+      - "https://mva.gov.ua/ua/news"
+    link_selector: "a[href*='/news/'], .views-row a"
+    max_per_source: 10
+    detail:
+      title_selectors: ["h1", ".node__title", ".page-title"]
+      summary_selectors: [".node__content p", ".content p", "article p"]
+      date_selectors: ["time[datetime]", ".field--name-created", ".date", ".published"]
+      date_attr: "datetime"
 
- - name: "Мінсоцполітики"
-   base: "https://www.msp.gov.ua"
-   start_urls: ["https://www.msp.gov.ua/press-center/news"]
-   allow: ["^https?://www\\.msp\\.gov\\.ua/press-center/news/[\\w\\-/]+"]
-   deny: ["/tag/", "/category/", "\\?.*"]
-   keywords: ["ветеран", "жкп", "виплат", "пільг"]
-   title_selector: "h1"
+  # Пенсійний фонд України — новини
+  - name: "ПФУ — новини"
+    list_urls:
+      - "https://www.pfu.gov.ua/novyny/"
+    link_selector: "article a, .news-item a, a[href*='/novyny/']"
+    max_per_source: 10
+    detail:
+      title_selectors: ["h1.entry-title", "h1", ".post-title"]
+      summary_selectors: [".entry-content p", "article p", ".post-content p"]
+      date_selectors: ["time[datetime]", "time[content]", ".post-date", ".entry-date"]
+      date_attr: "datetime"
 
- - name: "ПФУ"
-   base: "https://www.pfu.gov.ua"
-   start_urls:
-     - "https://www.pfu.gov.ua/news/"
-     - "https://www.pfu.gov.ua/"
-   allow: ["^https?://www\\.pfu\\.gov\\.ua/[a-z]{2}/[\\w\\-]+-\\d+/"]
-   deny: ["/category/", "/tag/", "\\.(pdf|jpg|png)$"]
-   keywords: ["ветеран", "пільг", "виплат", "субсид"]
-   title_selector: "h1"
-
- - name: "МОЗ"
-   base: "https://moz.gov.ua"
-   start_urls: ["https://moz.gov.ua/uk"]
-   allow: ["^https?://moz\\.gov\\.ua/uk/[\\w\\-/]+"]
-   deny: ["/category/", "/tag/", "\\.(pdf|jpg|png)$"]
-   keywords: ["ветеран", "реабілітац", "нсзу"]
-   title_selector: "h1"
+  # Е-Ветеран — новини
+  - name: "Е-Ветеран — новини"
+    list_urls:
+      - "https://eveteran.gov.ua/novini"
+    link_selector: "a[href*='/novini/'], .news a, .views-row a"
+    max_per_source: 10
+    detail:
+      title_selectors: ["h1", ".page-title", ".node__title"]
+      summary_selectors: [".content p", "article p"]
+      date_selectors: ["time[datetime]", ".date", ".published"]
+      date_attr: "datetime"
