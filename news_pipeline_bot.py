@@ -30,6 +30,7 @@ Telegram News → Channel pipeline with human approval
 """
 
 import os
+import logging
 import sqlite3
 import html as htmlmod
 from datetime import datetime, timedelta, time as dtime
@@ -48,6 +49,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# Import helper utilities for URL canonicalization and text clamping
+try:
+    # utils_normalize provides canonical_url and clamp functions
+    from utils_normalize import canonical_url, clamp  # type: ignore
+except Exception:
+    # Fallbacks in case utils_normalize is unavailable
+    def canonical_url(url: str) -> str:  # type: ignore
+        return url or ""
+    def clamp(text: str, limit: int = 750) -> str:  # type: ignore
+        return (text or "")[:limit]
 
 # Загрузка змінних середовища
 load_dotenv()
@@ -79,6 +91,10 @@ except Exception:
     collect_nonrss = None
 
 TZ = ZoneInfo(TIMEZONE)
+
+# Set up basic logging configuration. This will print timestamps and log levels.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("newsbot")
 
 
 # ---------- База даних ----------
@@ -123,8 +139,19 @@ def add_item(url: str, title: str, summary: str, source: str, published_at: str)
     Додає елемент у таблицю news, якщо такого URL ще немає.
     Повертає id нового рядка або None, якщо дублікат.
     """
+    # Normalize inputs: ensure URL and title exist, apply canonicalization and trimming.
     if not url or not title:
         return None
+    # Canonicalize the URL to remove tracking parameters (utm_source, fbclid, etc.).
+    try:
+        url = canonical_url(url)
+    except Exception:
+        # In case canonicalization fails, keep the original URL
+        url = url
+    # Clean up title and summary
+    title = (title or "").strip()
+    # Clamp summary to a reasonable length to avoid overly long entries
+    summary = clamp((summary or "").strip(), 750)
     conn = db()
     c = conn.cursor()
     try:
@@ -494,6 +521,54 @@ async def schedule_0900(context: ContextTypes.DEFAULT_TYPE, item_id: int) -> Non
     mark_status(item_id, "APPROVED", scheduled_for=target.isoformat())
 
 
+async def restore_scheduled_jobs(app):
+    """
+    On startup, re-schedule any previously approved posts that have a future
+    scheduled_for timestamp. This ensures that if the bot restarts, scheduled
+    publications are not lost.
+
+    Args:
+        app: The telegram.ext.Application instance to schedule jobs on.
+    """
+    try:
+        conn = db()
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, scheduled_for FROM news
+            WHERE status='APPROVED' AND scheduled_for IS NOT NULL
+            """
+        )
+        rows = c.fetchall()
+        now = datetime.now(TZ)
+        restored = 0
+        for r in rows:
+            try:
+                ts = r["scheduled_for"]
+                if not ts:
+                    continue
+                # Convert stored ISO timestamp to aware datetime
+                target = datetime.fromisoformat(ts)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=TZ)
+                if target > now:
+                    delay = (target - now).total_seconds()
+                    app.job_queue.run_once(
+                        publish_item_job,
+                        when=delay,
+                        data={"item_id": r["id"]},
+                        name=f"publish_{r['id']}",
+                    )
+                    restored += 1
+            except Exception as exc:
+                # Log and continue on failure
+                log.error("Failed to restore scheduled job for item %s: %s", r["id"], exc, exc_info=True)
+        conn.close()
+        log.info("Restored %d scheduled jobs from DB", restored)
+    except Exception as exc:
+        log.error("Error while restoring scheduled jobs: %s", exc, exc_info=True)
+
+
 # ---------- Команди ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,7 +804,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_handler))
     # Щоденний автозбір о 08:45 (Київ)
     app.job_queue.run_daily(collect_job, time=dtime(8, 45, tzinfo=TZ), name="collect_daily")
-    print("Bot started. Press Ctrl+C to stop.")
+    # Restore any scheduled publications from previous runs
+    # post_init ensures this runs after the bot has been started but before polling begins
+    app.post_init(restore_scheduled_jobs)
+    log.info("Bot started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
