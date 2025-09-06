@@ -791,7 +791,16 @@ def main() -> None:
     init_db()
     if not BOT_TOKEN or not CHANNEL_ID:
         raise SystemExit("Set BOT_TOKEN and CHANNEL_ID in .env")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Build the application and register the post_init hook on the builder.
+    # In PTB v21, post_init is configured on the ApplicationBuilder rather than on
+    # the built Application instance. If app.post_init(...) is called on
+    # the Application instance directly, it will be None and cause a TypeError.
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(restore_scheduled_jobs)
+        .build()
+    )
     # Команди
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("review", review))
@@ -804,9 +813,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_handler))
     # Щоденний автозбір о 08:45 (Київ)
     app.job_queue.run_daily(collect_job, time=dtime(8, 45, tzinfo=TZ), name="collect_daily")
-    # Restore any scheduled publications from previous runs
-    # post_init ensures this runs after the bot has been started but before polling begins
-    app.post_init(restore_scheduled_jobs)
+    # Any scheduled publications from previous runs are restored via the
+    # post_init hook registered on the builder above. Do not call
+    # app.post_init(...) here, as the method would be None on the built app.
     log.info("Bot started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
